@@ -1,0 +1,1072 @@
+// ===========================================
+// AGENTIC AI LEARNING MENTOR - NEXT LEVEL
+// Powered by Claude API with Tool Use
+// ===========================================
+
+const express = require('express');
+const cors = require('cors');
+const multer = require('multer');
+const pdfParse = require('pdf-parse');
+const fs = require('fs');
+const path = require('path');
+const Anthropic = require('@anthropic-ai/sdk');
+
+const app = express();
+
+// ── Middleware ──────────────────────────────
+app.use(cors({ origin: '*', methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'] }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+
+// ── File Upload ─────────────────────────────
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const dir = path.join(__dirname, 'uploads');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    cb(null, dir);
+  },
+  filename: (req, file, cb) => cb(null, `pdf-${Date.now()}.pdf`)
+});
+const upload = multer({
+  storage,
+  fileFilter: (req, file, cb) => {
+    file.mimetype === 'application/pdf' ? cb(null, true) : cb(new Error('PDF only'));
+  },
+  limits: { fileSize: 10 * 1024 * 1024 }
+});
+
+// ── Anthropic Client ────────────────────────
+const anthropic = new Anthropic({
+  apiKey: process.env.ANTHROPIC_API_KEY || 'YOUR_CLAUDE_API_KEY_HERE'
+});
+
+// ── In-Memory Stores ────────────────────────
+const users   = new Map();   // userId → userProfile
+const pdfStore = new Map();  // userId → { text, lessons, subject, ... }
+const agentMemory = new Map(); // userId → { conversationHistory, weakSpots, ... }
+
+// ── Default User Factory ────────────────────
+const newUser = (userId) => ({
+  userId,
+  level: 1, xp: 0,
+  companion: '🥚',
+  streak: 0, highestStreak: 0,
+  totalQuestions: 0, correctAnswers: 0, accuracy: 0,
+  achievements: [],
+  currentLessonIndex: 0,
+  completedLessons: [],
+  weakSpots: {},          // topic → failCount
+  masteredTopics: [],
+  learningPace: 'normal',
+  learningStyle: 'visual',
+  sessionCount: 1,
+  totalTimeSpent: 0,
+  lastActive: new Date().toISOString(),
+  createdAt: new Date().toISOString(),
+  agentClarifications: [], // AI asked & student answered
+  performanceHistory: [],  // last 20 answers
+});
+
+// ══════════════════════════════════════════════
+// AGENTIC TOOL DEFINITIONS FOR CLAUDE
+// ══════════════════════════════════════════════
+const AGENT_TOOLS = [
+  {
+    name: "analyze_student_profile",
+    description: "Analyze the student's learning profile including weak spots, pace, accuracy, and recent performance to personalize lessons",
+    input_schema: {
+      type: "object",
+      properties: {
+        userId: { type: "string", description: "The student's user ID" },
+        analysisDepth: { type: "string", enum: ["quick", "deep"], description: "How deeply to analyze" }
+      },
+      required: ["userId"]
+    }
+  },
+  {
+    name: "extract_key_concepts",
+    description: "Extract and categorize key concepts, topics, and learning objectives from PDF text",
+    input_schema: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "PDF text to analyze" },
+        targetLevel: { type: "number", description: "Student's current level 1-10" }
+      },
+      required: ["text"]
+    }
+  },
+  {
+    name: "generate_lesson",
+    description: "Generate a complete structured lesson for a specific concept with visual diagram, explanation, examples and questions",
+    input_schema: {
+      type: "object",
+      properties: {
+        concept: { type: "string", description: "The concept to teach" },
+        difficulty: { type: "number", description: "Difficulty 1-5" },
+        studentWeakSpots: { type: "array", items: { type: "string" }, description: "Topics student struggles with" },
+        learningStyle: { type: "string", enum: ["visual", "analytical", "practical"], description: "Student's preferred learning style" },
+        pdfContext: { type: "string", description: "Relevant PDF text for this concept" }
+      },
+      required: ["concept", "difficulty", "pdfContext"]
+    }
+  },
+  {
+    name: "generate_adaptive_questions",
+    description: "Generate questions adapted to student's weak spots and performance history. Mix easy reinforcement with challenging growth questions",
+    input_schema: {
+      type: "object",
+      properties: {
+        topic: { type: "string", description: "Topic to generate questions for" },
+        weakSpots: { type: "array", items: { type: "string" }, description: "Student's weak areas" },
+        recentAccuracy: { type: "number", description: "Student's recent accuracy 0-100" },
+        questionCount: { type: "number", description: "Number of questions to generate" },
+        pdfContext: { type: "string", description: "Context from PDF" }
+      },
+      required: ["topic", "pdfContext"]
+    }
+  },
+  {
+    name: "diagnose_misconception",
+    description: "When student answers incorrectly, diagnose the likely misconception and generate a targeted remediation explanation",
+    input_schema: {
+      type: "object",
+      properties: {
+        question: { type: "string", description: "The question that was asked" },
+        correctAnswer: { type: "string", description: "The correct answer" },
+        studentAnswer: { type: "string", description: "What the student answered" },
+        topic: { type: "string", description: "Topic being tested" },
+        context: { type: "string", description: "PDF context for this topic" }
+      },
+      required: ["question", "correctAnswer", "studentAnswer", "topic"]
+    }
+  },
+  {
+    name: "generate_clarifying_question",
+    description: "Generate an intelligent clarifying question to better understand what the student needs or is confused about",
+    input_schema: {
+      type: "object",
+      properties: {
+        situation: { type: "string", description: "Current learning situation" },
+        studentProfile: { type: "object", description: "Student stats" }
+      },
+      required: ["situation"]
+    }
+  },
+  {
+    name: "update_learning_path",
+    description: "Autonomously update and reorder the learning path based on student's current performance and weak spots",
+    input_schema: {
+      type: "object",
+      properties: {
+        userId: { type: "string" },
+        currentPath: { type: "array", items: { type: "string" } },
+        performance: { type: "object", description: "Current performance metrics" }
+      },
+      required: ["userId", "currentPath", "performance"]
+    }
+  },
+  {
+    name: "generate_hint",
+    description: "Generate a progressive hint for a student who is struggling, without giving away the answer",
+    input_schema: {
+      type: "object",
+      properties: {
+        question: { type: "string" },
+        hintLevel: { type: "number", description: "1=subtle, 2=moderate, 3=strong" },
+        context: { type: "string" }
+      },
+      required: ["question", "hintLevel"]
+    }
+  },
+  {
+    name: "assess_mastery",
+    description: "Assess whether student has truly mastered a topic or needs more practice",
+    input_schema: {
+      type: "object",
+      properties: {
+        topic: { type: "string" },
+        recentAnswers: { type: "array", description: "Recent answer results for this topic" },
+        timeSpent: { type: "number", description: "Time spent on this topic in seconds" }
+      },
+      required: ["topic", "recentAnswers"]
+    }
+  }
+];
+
+// ══════════════════════════════════════════════
+// TOOL EXECUTION ENGINE
+// ══════════════════════════════════════════════
+async function executeTool(toolName, toolInput, userId) {
+  const user = users.get(userId) || newUser(userId);
+  const pdfData = pdfStore.get(userId);
+  const memory = agentMemory.get(userId) || { conversationHistory: [], insights: [] };
+
+  console.log(`🔧 Executing tool: ${toolName}`);
+
+  switch (toolName) {
+
+    case "analyze_student_profile": {
+      const weakSpotsSorted = Object.entries(user.weakSpots || {})
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5)
+        .map(([topic, count]) => ({ topic, failCount: count }));
+
+      const recentPerf = (user.performanceHistory || []).slice(-10);
+      const recentAccuracy = recentPerf.length > 0
+        ? Math.round(recentPerf.filter(r => r.correct).length / recentPerf.length * 100)
+        : user.accuracy;
+
+      return {
+        profile: {
+          level: user.level,
+          xp: user.xp,
+          accuracy: user.accuracy,
+          recentAccuracy,
+          streak: user.streak,
+          learningPace: user.learningPace,
+          learningStyle: user.learningStyle,
+          weakSpots: weakSpotsSorted,
+          masteredTopics: user.masteredTopics || [],
+          totalSessions: user.sessionCount,
+          engagementScore: Math.min(100, (user.streak * 5) + (user.accuracy * 0.5)),
+          recommendation: recentAccuracy > 80 ? "increase_difficulty" :
+                          recentAccuracy < 40 ? "remediation_needed" : "maintain_pace"
+        }
+      };
+    }
+
+    case "extract_key_concepts": {
+      // This would call Claude again for analysis — for now return structure
+      const text = toolInput.text || '';
+      const words = text.split(/\s+/);
+      // Simple heuristic extraction
+      const sentences = text.match(/[^.!?]+[.!?]+/g) || [];
+      return {
+        conceptMap: {
+          primaryTopic: "Extracted from PDF",
+          sections: sentences.slice(0, 5).map((s, i) => ({
+            id: i + 1,
+            summary: s.trim().substring(0, 100),
+            importance: "high"
+          })),
+          estimatedDifficulty: toolInput.targetLevel <= 3 ? "beginner" : "intermediate",
+          wordCount: words.length
+        }
+      };
+    }
+
+    case "generate_lesson": {
+      // Call Claude to actually generate the lesson content
+      const lessonPrompt = `You are an expert teacher. Generate a complete lesson for:
+
+CONCEPT: ${toolInput.concept}
+DIFFICULTY: ${toolInput.difficulty}/5
+STUDENT WEAK SPOTS: ${(toolInput.studentWeakSpots || []).join(', ') || 'None identified'}
+LEARNING STYLE: ${toolInput.learningStyle || 'visual'}
+
+PDF CONTEXT:
+${toolInput.pdfContext.substring(0, 2000)}
+
+Generate a lesson with this EXACT JSON structure (return ONLY JSON):
+{
+  "id": ${Date.now()},
+  "title": "emoji + engaging title",
+  "concept": "${toolInput.concept}",
+  "difficulty": ${toolInput.difficulty},
+  "visual": "detailed multi-line ASCII art diagram with boxes, arrows, and labels",
+  "explanation": "4-5 sentence comprehensive explanation adapted to ${toolInput.learningStyle} learning style",
+  "examples": ["3 detailed examples from the PDF context"],
+  "keyTerms": ["5-7 key terms"],
+  "mnemonicTip": "A memory trick or mnemonic to remember this concept",
+  "realWorldConnection": "How this connects to real life",
+  "commonMistakes": ["2-3 common mistakes students make"],
+  "summary": "2-3 sentence summary",
+  "estimatedTime": "X minutes",
+  "prerequisites": []
+}`;
+
+      const resp = await anthropic.messages.create({
+        model: "claude-sonnet-4-5",
+        max_tokens: 2000,
+        messages: [{ role: "user", content: lessonPrompt }]
+      });
+
+      let text = resp.content[0].text;
+      const match = text.match(/```(?:json)?\n?([\s\S]*?)\n?```/) || text.match(/(\{[\s\S]*\})/);
+      if (match) text = match[1];
+
+      try {
+        return { lesson: JSON.parse(text.trim()) };
+      } catch {
+        return { lesson: { title: toolInput.concept, explanation: text, difficulty: toolInput.difficulty } };
+      }
+    }
+
+    case "generate_adaptive_questions": {
+      const qPrompt = `Generate ${toolInput.questionCount || 3} adaptive quiz questions for:
+
+TOPIC: ${toolInput.topic}
+STUDENT WEAK SPOTS: ${(toolInput.weakSpots || []).join(', ') || 'None'}
+RECENT ACCURACY: ${toolInput.recentAccuracy || 70}%
+
+PDF CONTEXT:
+${toolInput.pdfContext.substring(0, 1500)}
+
+Rules:
+- If accuracy < 50%: make 2 easy reinforcement + 1 medium question
+- If accuracy 50-75%: make 1 easy + 1 medium + 1 hard
+- If accuracy > 75%: make 1 medium + 2 hard challenge questions
+- Target weak spots specifically
+
+Return ONLY JSON array:
+[
+  {
+    "id": 1,
+    "text": "question text",
+    "type": "multiple_choice",
+    "options": ["A) option", "B) option", "C) option", "D) option"],
+    "correct": "A) option",
+    "explanation": "why this is correct",
+    "difficulty": "easy/medium/hard",
+    "topic": "specific topic",
+    "targetedWeakSpot": true/false,
+    "hint": "a subtle hint if student is stuck"
+  }
+]`;
+
+      const resp = await anthropic.messages.create({
+        model: "claude-sonnet-4-5",
+        max_tokens: 2000,
+        messages: [{ role: "user", content: qPrompt }]
+      });
+
+      let text = resp.content[0].text;
+      const match = text.match(/```(?:json)?\n?([\s\S]*?)\n?```/) || text.match(/(\[[\s\S]*\])/);
+      if (match) text = match[1];
+
+      try {
+        return { questions: JSON.parse(text.trim()) };
+      } catch {
+        return { questions: [] };
+      }
+    }
+
+    case "diagnose_misconception": {
+      const diagPrompt = `A student answered a question incorrectly. Diagnose the misconception.
+
+QUESTION: ${toolInput.question}
+CORRECT ANSWER: ${toolInput.correctAnswer}
+STUDENT ANSWERED: ${toolInput.studentAnswer}
+TOPIC: ${toolInput.topic}
+CONTEXT: ${(toolInput.context || '').substring(0, 500)}
+
+Provide:
+1. The likely misconception
+2. A targeted, empathetic remediation explanation (2-3 sentences)
+3. An analogy to help understand the correct concept
+4. A follow-up mini-challenge to solidify understanding
+
+Return JSON:
+{
+  "misconception": "what the student likely misunderstood",
+  "remediation": "targeted explanation",
+  "analogy": "helpful real-world analogy",
+  "encouragement": "motivating message",
+  "miniChallenge": "a simpler version of the question to rebuild confidence"
+}`;
+
+      const resp = await anthropic.messages.create({
+        model: "claude-sonnet-4-5",
+        max_tokens: 800,
+        messages: [{ role: "user", content: diagPrompt }]
+      });
+
+      let text = resp.content[0].text;
+      const match = text.match(/```(?:json)?\n?([\s\S]*?)\n?```/) || text.match(/(\{[\s\S]*\})/);
+      if (match) text = match[1];
+
+      try {
+        return JSON.parse(text.trim());
+      } catch {
+        return {
+          misconception: "Misunderstanding of core concept",
+          remediation: resp.content[0].text,
+          analogy: "Think of it like...",
+          encouragement: "Keep going, you're learning!",
+          miniChallenge: null
+        };
+      }
+    }
+
+    case "generate_clarifying_question": {
+      const clPrompt = `Generate ONE intelligent clarifying question to understand what the student needs.
+
+SITUATION: ${toolInput.situation}
+STUDENT LEVEL: ${toolInput.studentProfile?.level || 1}
+ACCURACY: ${toolInput.studentProfile?.accuracy || 0}%
+
+The question should help personalize their learning. Return JSON:
+{
+  "question": "the clarifying question",
+  "purpose": "why this helps personalize learning",
+  "followUpOptions": ["option1", "option2", "option3"]
+}`;
+
+      const resp = await anthropic.messages.create({
+        model: "claude-sonnet-4-5",
+        max_tokens: 400,
+        messages: [{ role: "user", content: clPrompt }]
+      });
+
+      let text = resp.content[0].text;
+      const match = text.match(/(\{[\s\S]*\})/);
+      if (match) text = match[1];
+
+      try {
+        return JSON.parse(text.trim());
+      } catch {
+        return { question: "How comfortable are you with this topic?", followUpOptions: ["Beginner", "Some experience", "Advanced"] };
+      }
+    }
+
+    case "update_learning_path": {
+      const weakTopics = Object.entries(user.weakSpots || {})
+        .sort((a, b) => b[1] - a[1])
+        .map(([t]) => t);
+
+      // Reorder path: put weak topics first for remediation
+      const reordered = [...(toolInput.currentPath || [])].sort((a, b) => {
+        const aWeak = weakTopics.indexOf(a);
+        const bWeak = weakTopics.indexOf(b);
+        if (aWeak === -1 && bWeak === -1) return 0;
+        if (aWeak === -1) return 1;
+        if (bWeak === -1) return -1;
+        return aWeak - bWeak;
+      });
+
+      return {
+        updatedPath: reordered,
+        changes: weakTopics.length > 0 ? `Prioritized ${weakTopics[0]} for remediation` : "Path maintained",
+        remedialTopics: weakTopics.slice(0, 3)
+      };
+    }
+
+    case "generate_hint": {
+      const hintPrompts = [
+        `Give a very subtle hint for: "${toolInput.question}". Don't give the answer. 1 sentence.`,
+        `Give a moderate hint for: "${toolInput.question}". Point toward the answer. 2 sentences.`,
+        `Give a strong hint for: "${toolInput.question}". Almost give the answer. 2-3 sentences.`
+      ];
+      const level = Math.min(3, Math.max(1, toolInput.hintLevel || 1)) - 1;
+
+      const resp = await anthropic.messages.create({
+        model: "claude-sonnet-4-5",
+        max_tokens: 200,
+        messages: [{ role: "user", content: hintPrompts[level] + `\nContext: ${(toolInput.context || '').substring(0, 300)}` }]
+      });
+
+      return { hint: resp.content[0].text.trim(), level: toolInput.hintLevel };
+    }
+
+    case "assess_mastery": {
+      const answers = toolInput.recentAnswers || [];
+      const correct = answers.filter(a => a === true || a?.correct === true).length;
+      const rate = answers.length > 0 ? correct / answers.length : 0;
+      const avgTime = toolInput.timeSpent / Math.max(1, answers.length);
+
+      let masteryLevel, recommendation;
+      if (rate >= 0.9 && avgTime < 30) {
+        masteryLevel = "mastered";
+        recommendation = "advance";
+      } else if (rate >= 0.7) {
+        masteryLevel = "proficient";
+        recommendation = "review_once_then_advance";
+      } else if (rate >= 0.5) {
+        masteryLevel = "developing";
+        recommendation = "more_practice";
+      } else {
+        masteryLevel = "struggling";
+        recommendation = "full_remediation";
+      }
+
+      return { topic: toolInput.topic, masteryLevel, accuracyRate: Math.round(rate * 100), recommendation, avgTimeSeconds: Math.round(avgTime) };
+    }
+
+    default:
+      return { error: `Unknown tool: ${toolName}` };
+  }
+}
+
+// ══════════════════════════════════════════════
+// CORE AGENTIC LOOP - Multi-step autonomous AI
+// ══════════════════════════════════════════════
+async function runAgentLoop(systemPrompt, userMessage, userId, maxIterations = 8) {
+  const memory = agentMemory.get(userId) || { conversationHistory: [], insights: [] };
+  const messages = [{ role: "user", content: userMessage }];
+
+  let iteration = 0;
+  let finalResult = null;
+
+  while (iteration < maxIterations) {
+    iteration++;
+    console.log(`🤖 Agent iteration ${iteration}/${maxIterations}`);
+
+    const response = await anthropic.messages.create({
+      model: "claude-sonnet-4-5",
+      max_tokens: 4000,
+      system: systemPrompt,
+      tools: AGENT_TOOLS,
+      messages
+    });
+
+    // Add assistant response to conversation
+    messages.push({ role: "assistant", content: response.content });
+
+    // Check stop condition
+    if (response.stop_reason === "end_turn") {
+      const textBlock = response.content.find(b => b.type === "text");
+      finalResult = textBlock ? textBlock.text : null;
+      break;
+    }
+
+    // Process tool calls
+    if (response.stop_reason === "tool_use") {
+      const toolUseBlocks = response.content.filter(b => b.type === "tool_use");
+      const toolResults = [];
+
+      for (const toolUse of toolUseBlocks) {
+        console.log(`  🔧 Tool called: ${toolUse.name}`);
+        let result;
+        try {
+          result = await executeTool(toolUse.name, toolUse.input, userId);
+          console.log(`  ✅ Tool ${toolUse.name} completed`);
+        } catch (err) {
+          console.error(`  ❌ Tool ${toolUse.name} failed:`, err.message);
+          result = { error: err.message };
+        }
+
+        toolResults.push({
+          type: "tool_result",
+          tool_use_id: toolUse.id,
+          content: JSON.stringify(result)
+        });
+      }
+
+      messages.push({ role: "user", content: toolResults });
+    }
+
+    if (iteration >= maxIterations) {
+      console.warn("⚠️ Agent hit max iterations");
+      const lastText = response.content.find(b => b.type === "text");
+      finalResult = lastText?.text || "Agent completed processing";
+    }
+  }
+
+  // Store conversation to memory
+  memory.conversationHistory = messages.slice(-20); // Keep last 20
+  agentMemory.set(userId, memory);
+
+  return finalResult;
+}
+
+// ══════════════════════════════════════════════
+// MAIN AI FUNCTION: PDF → Lessons via Agent
+// ══════════════════════════════════════════════
+async function agentGenerateLessons(pdfText, userId) {
+  console.log('\n🤖 AGENTIC LESSON GENERATION STARTED');
+  const user = users.get(userId) || newUser(userId);
+
+  const systemPrompt = `You are an AUTONOMOUS AI LEARNING AGENT with advanced pedagogical intelligence.
+
+Your goal: Analyze a PDF and create the most effective, personalized learning experience possible.
+
+You have tools to:
+1. First analyze the student's profile to understand their needs
+2. Extract key concepts from the PDF
+3. Generate complete lessons tailored to the student
+4. Create adaptive questions targeting weak spots
+5. Assess what level of difficulty is appropriate
+
+ALWAYS follow this agentic workflow:
+1. Call analyze_student_profile first
+2. Call extract_key_concepts on the PDF
+3. For each major concept, call generate_lesson
+4. For each lesson, call generate_adaptive_questions
+5. Return a complete structured curriculum
+
+You are autonomous - use your tools intelligently without being told what to do step by step.
+Be creative, empathetic, and pedagogically sophisticated.`;
+
+  const userMessage = `Analyze this PDF and create a complete personalized curriculum for student ${userId}.
+
+PDF CONTENT (first 4000 chars):
+${pdfText.substring(0, 4000)}
+
+FULL TEXT LENGTH: ${pdfText.length} characters
+
+Create 3-5 complete lessons with adaptive questions. Use your tools autonomously.
+Return the final curriculum as valid JSON:
+{
+  "subject": "...",
+  "lessons": [...complete lesson objects with questions...],
+  "metadata": { "totalLessons": N, "difficulty": "...", "tags": [...] }
+}`;
+
+  try {
+    const result = await runAgentLoop(systemPrompt, userMessage, userId, 10);
+
+    // Parse result
+    let jsonStr = result || '{}';
+    const match = jsonStr.match(/```(?:json)?\n?([\s\S]*?)\n?```/) || jsonStr.match(/(\{[\s\S]*\})/);
+    if (match) jsonStr = match[1];
+
+    const parsed = JSON.parse(jsonStr.trim());
+    console.log(`✅ Agent generated ${parsed.lessons?.length || 0} lessons`);
+    return parsed;
+
+  } catch (err) {
+    console.error('❌ Agent loop error:', err);
+    // Fallback: Direct generation
+    return await fallbackGenerateLessons(pdfText, userId);
+  }
+}
+
+async function fallbackGenerateLessons(pdfText, userId) {
+  console.log('📚 Running fallback lesson generation...');
+  const prompt = `Analyze this PDF and return 3 lessons as JSON:
+${pdfText.substring(0, 3000)}
+
+Return ONLY valid JSON:
+{
+  "subject": "subject name",
+  "lessons": [
+    {
+      "id": 1,
+      "title": "📚 Lesson Title",
+      "visual": "ASCII diagram",
+      "explanation": "4-5 sentence explanation",
+      "examples": ["example 1", "example 2", "example 3"],
+      "keyTerms": ["term1", "term2"],
+      "questions": [
+        {
+          "id": 1,
+          "text": "question?",
+          "options": ["A) opt1", "B) opt2", "C) opt3", "D) opt4"],
+          "correct": "A) opt1",
+          "explanation": "why",
+          "difficulty": "easy",
+          "topic": "topic",
+          "hint": "hint"
+        }
+      ],
+      "difficulty": 1,
+      "mnemonicTip": "memory tip",
+      "commonMistakes": ["mistake1"],
+      "realWorldConnection": "connection",
+      "estimatedTime": "10 minutes"
+    }
+  ],
+  "metadata": { "totalLessons": 3, "difficulty": "beginner", "tags": ["tag1"] }
+}`;
+
+  const resp = await anthropic.messages.create({
+    model: "claude-sonnet-4-5",
+    max_tokens: 4000,
+    messages: [{ role: "user", content: prompt }]
+  });
+
+  let text = resp.content[0].text;
+  const match = text.match(/```(?:json)?\n?([\s\S]*?)\n?```/) || text.match(/(\{[\s\S]*\})/);
+  if (match) text = match[1];
+  return JSON.parse(text.trim());
+}
+
+// ══════════════════════════════════════════════
+// AGENTIC MISCONCEPTION DIAGNOSIS
+// ══════════════════════════════════════════════
+async function agentDiagnoseMisconception(userId, question, correctAnswer, studentAnswer, topic) {
+  const user = users.get(userId);
+  const pdfData = pdfStore.get(userId);
+
+  const systemPrompt = `You are an empathetic AI tutor specializing in diagnosing student misconceptions.
+When a student gets something wrong, you don't just tell them the answer - you understand WHY they got it wrong
+and provide targeted, encouraging remediation. Use your tools to analyze and respond.`;
+
+  const userMessage = `A student just answered incorrectly. Help them understand.
+
+Question: ${question}
+Correct Answer: ${correctAnswer}  
+Student Answered: ${studentAnswer}
+Topic: ${topic}
+Student Level: ${user?.level || 1}
+Student Accuracy: ${user?.accuracy || 0}%
+
+Use diagnose_misconception tool then provide a complete remediation response.`;
+
+  try {
+    return await runAgentLoop(systemPrompt, userMessage, userId, 4);
+  } catch (err) {
+    return `Great effort! The correct answer is ${correctAnswer}. ${topic} can be tricky. Review the explanation above and try again!`;
+  }
+}
+
+// ══════════════════════════════════════════════
+// AGENTIC HINT GENERATION
+// ══════════════════════════════════════════════
+async function agentGetHint(userId, question, hintLevel, context) {
+  const systemPrompt = `You are a Socratic AI tutor. You give hints that guide students to the answer without giving it away.`;
+  const userMessage = `Generate a level ${hintLevel} hint for: "${question}"\nContext: ${(context || '').substring(0, 300)}`;
+
+  try {
+    return await runAgentLoop(systemPrompt, userMessage, userId, 3);
+  } catch {
+    return "Think carefully about the key terms in the question...";
+  }
+}
+
+// ══════════════════════════════════════════════
+// AGENTIC CLARIFYING QUESTION
+// ══════════════════════════════════════════════
+async function agentAskClarification(userId, situation) {
+  const user = users.get(userId) || newUser(userId);
+
+  const systemPrompt = `You are an intelligent learning companion. Ask ONE concise clarifying question to personalize the student's learning experience.`;
+  const userMessage = `Situation: ${situation}\nStudent profile: Level ${user.level}, Accuracy ${user.accuracy}%, Weak spots: ${Object.keys(user.weakSpots || {}).slice(0,3).join(', ')}`;
+
+  try {
+    const result = await runAgentLoop(systemPrompt, userMessage, userId, 3);
+    return result;
+  } catch {
+    return "How would you describe your current understanding of this topic?";
+  }
+}
+
+// ══════════════════════════════════════════════
+// ROUTES
+// ══════════════════════════════════════════════
+
+app.get('/', (req, res) => {
+  res.json({
+    success: true,
+    message: '🤖 AGENTIC AI LEARNING MENTOR - RUNNING',
+    version: '3.0.0-agentic',
+    agentCapabilities: [
+      'Multi-step autonomous lesson planning',
+      'Real-time misconception diagnosis',
+      'Adaptive difficulty via tool use',
+      'Student weak-spot detection',
+      'Progressive hint generation',
+      'Clarifying question generation',
+      'Mastery assessment',
+      'Learning path optimization'
+    ],
+    tools: AGENT_TOOLS.map(t => t.name)
+  });
+});
+
+// ── Upload PDF ──────────────────────────────
+app.post('/api/upload-pdf', upload.single('pdf'), async (req, res) => {
+  console.log('\n' + '═'.repeat(60));
+  console.log('📤 AGENTIC PDF UPLOAD');
+  console.log('═'.repeat(60));
+
+  try {
+    if (!req.file) return res.status(400).json({ success: false, error: 'No PDF uploaded' });
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ success: false, error: 'Missing userId' });
+
+    if (!users.has(userId)) users.set(userId, newUser(userId));
+    const user = users.get(userId);
+    user.sessionCount++;
+
+    console.log(`👤 User: ${userId} | File: ${req.file.originalname}`);
+
+    const buffer = fs.readFileSync(req.file.path);
+    const pdfData = await pdfParse(buffer);
+    console.log(`📄 Pages: ${pdfData.numpages} | Text: ${pdfData.text.length} chars`);
+
+    // 🤖 Run agentic lesson generation
+    const curriculum = await agentGenerateLessons(pdfData.text, userId);
+
+    pdfStore.set(userId, {
+      filename: req.file.originalname,
+      pages: pdfData.numpages,
+      text: pdfData.text,
+      textPreview: pdfData.text.substring(0, 2000),
+      lessons: curriculum.lessons || [],
+      subject: curriculum.subject || 'Your Subject',
+      metadata: curriculum.metadata || {},
+      uploadedAt: new Date().toISOString()
+    });
+
+    user.totalLessons = curriculum.lessons?.length || 0;
+    user.currentLessonIndex = 0;
+
+    fs.unlinkSync(req.file.path);
+
+    // Ask first clarifying question
+    const clarification = await agentAskClarification(userId, `Student just uploaded a PDF about "${curriculum.subject}"`);
+
+    res.json({
+      success: true,
+      message: '✅ PDF analyzed by Agentic AI!',
+      subject: curriculum.subject,
+      lessonsCreated: curriculum.lessons?.length || 0,
+      difficulty: curriculum.metadata?.difficulty || 'adaptive',
+      clarifyingQuestion: clarification,
+      user: {
+        level: user.level, xp: user.xp, companion: user.companion,
+        streak: user.streak, accuracy: user.accuracy
+      }
+    });
+
+  } catch (err) {
+    console.error('❌ Upload error:', err);
+    if (req.file) try { fs.unlinkSync(req.file.path); } catch {}
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Get Lesson ──────────────────────────────
+app.post('/api/get-lesson', (req, res) => {
+  try {
+    const { userId } = req.body;
+    const user = users.get(userId);
+    const data = pdfStore.get(userId);
+
+    if (!data?.lessons?.length) {
+      return res.json({ success: false, lesson: null, message: 'No lessons yet. Upload a PDF first.' });
+    }
+
+    const idx = user?.currentLessonIndex || 0;
+    const lesson = data.lessons[idx];
+
+    if (user) user.lastActive = new Date().toISOString();
+
+    res.json({
+      success: true,
+      lesson,
+      progress: {
+        current: idx + 1,
+        total: data.lessons.length,
+        percentage: Math.round(((idx + 1) / data.lessons.length) * 100),
+        completedLessons: user?.completedLessons?.length || 0
+      },
+      user: user ? {
+        level: user.level, xp: user.xp, companion: user.companion,
+        streak: user.streak, accuracy: user.accuracy, weakSpots: user.weakSpots
+      } : null
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Submit Answer (with agentic diagnosis) ──
+app.post('/api/submit-answer', async (req, res) => {
+  try {
+    const { userId, isCorrect, questionId, question, correctAnswer, studentAnswer, topic, timeSpent } = req.body;
+
+    let user = users.get(userId);
+    if (!user) { user = newUser(userId); users.set(userId, user); }
+
+    // Update stats
+    user.totalQuestions++;
+    user.performanceHistory = [...(user.performanceHistory || []), { correct: isCorrect, topic, time: timeSpent }].slice(-20);
+
+    if (isCorrect) {
+      user.correctAnswers++;
+      user.xp += 10;
+      user.streak++;
+      if (user.streak > user.highestStreak) user.highestStreak = user.streak;
+
+      // Mark topic progress
+      if (topic && user.weakSpots[topic]) {
+        user.weakSpots[topic] = Math.max(0, user.weakSpots[topic] - 1);
+        if (user.weakSpots[topic] === 0) delete user.weakSpots[topic];
+      }
+    } else {
+      user.streak = 0;
+      // Track weak spots
+      if (topic) user.weakSpots[topic] = (user.weakSpots[topic] || 0) + 1;
+    }
+
+    // Level up
+    const xpNeeded = user.level * 50;
+    if (user.xp >= xpNeeded) {
+      user.level++;
+      if (user.level >= 5) user.companion = '🐉';
+      else if (user.level >= 3) user.companion = '🐣';
+    }
+
+    // Achievements
+    const newAchievements = [];
+    if (user.streak >= 5 && !user.achievements.includes('🔥 Hot Streak')) {
+      user.achievements.push('🔥 Hot Streak'); user.xp += 25; newAchievements.push('🔥 Hot Streak');
+    }
+    if (user.correctAnswers >= 10 && !user.achievements.includes('🎯 Sharp Shooter')) {
+      user.achievements.push('🎯 Sharp Shooter'); user.xp += 30; newAchievements.push('🎯 Sharp Shooter');
+    }
+    if (user.level >= 3 && !user.achievements.includes('🐣 Evolved!')) {
+      user.achievements.push('🐣 Evolved!'); newAchievements.push('🐣 Evolved!');
+    }
+
+    user.accuracy = Math.round((user.correctAnswers / user.totalQuestions) * 100);
+    user.lastActive = new Date().toISOString();
+
+    let agentDiagnosis = null;
+    if (!isCorrect && question && correctAnswer) {
+      // 🤖 Agentic misconception diagnosis
+      agentDiagnosis = await agentDiagnoseMisconception(userId, question, correctAnswer, studentAnswer || 'unknown', topic || 'general');
+    }
+
+    res.json({
+      success: true,
+      correct: isCorrect,
+      agentDiagnosis,
+      newAchievements,
+      user: {
+        level: user.level, xp: user.xp, companion: user.companion,
+        streak: user.streak, highestStreak: user.highestStreak,
+        accuracy: user.accuracy, totalQuestions: user.totalQuestions,
+        weakSpots: user.weakSpots, achievements: user.achievements
+      },
+      feedback: isCorrect
+        ? { message: '✨ Correct! Great work!', xpGained: 10, encouragement: user.streak > 3 ? `${user.streak} in a row! You're on fire! 🔥` : 'Keep it up!' }
+        : { message: '🤔 Not quite right.', encouragement: 'Every mistake is data that makes you smarter!' }
+    });
+
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Get Hint (Agentic) ──────────────────────
+app.post('/api/get-hint', async (req, res) => {
+  try {
+    const { userId, question, hintLevel, context } = req.body;
+    const hint = await agentGetHint(userId, question, hintLevel || 1, context);
+    res.json({ success: true, hint, level: hintLevel });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Next Lesson ─────────────────────────────
+app.post('/api/next-lesson', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    const user = users.get(userId);
+    const data = pdfStore.get(userId);
+
+    if (!user || !data) return res.json({ success: false, hasNext: false });
+
+    const nextIdx = (user.currentLessonIndex || 0) + 1;
+    const prevId = data.lessons[user.currentLessonIndex]?.id;
+    if (prevId && !user.completedLessons.includes(prevId)) user.completedLessons.push(prevId);
+
+    if (nextIdx < data.lessons.length) {
+      user.currentLessonIndex = nextIdx;
+
+      // 🤖 Check if learning path needs adjustment
+      const weakSpotTopics = Object.keys(user.weakSpots || {});
+      let adaptiveMessage = null;
+      if (weakSpotTopics.length > 0) {
+        adaptiveMessage = `Agent noticed you're struggling with: ${weakSpotTopics[0]}. Next lesson will reinforce this.`;
+      }
+
+      res.json({
+        success: true,
+        hasNext: true,
+        adaptiveMessage,
+        nextLesson: { index: nextIdx, title: data.lessons[nextIdx]?.title, total: data.lessons.length },
+        user: { level: user.level, xp: user.xp, companion: user.companion }
+      });
+    } else {
+      user.xp += 100;
+      if (!user.achievements.includes('🏆 Course Master')) user.achievements.push('🏆 Course Master');
+
+      res.json({
+        success: true,
+        hasNext: false,
+        message: '🎉 Course complete! Incredible work!',
+        summary: {
+          totalLessons: data.lessons.length,
+          mastery: Math.round((user.completedLessons.length / data.lessons.length) * 100),
+          finalAccuracy: user.accuracy,
+          bonusXP: 100,
+          weakSpotsSummary: Object.keys(user.weakSpots || {})
+        },
+        user: { level: user.level, xp: user.xp, companion: user.companion, achievements: user.achievements }
+      });
+    }
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Progress ────────────────────────────────
+app.get('/api/progress/:userId', (req, res) => {
+  try {
+    const { userId } = req.params;
+    const user = users.get(userId);
+    const data = pdfStore.get(userId);
+
+    if (!user) return res.json({ success: true, exists: false });
+
+    const totalLessons = data?.lessons?.length || 0;
+    const completedLessons = user.completedLessons?.length || 0;
+
+    res.json({
+      success: true, exists: true,
+      user: {
+        level: user.level, xp: user.xp, companion: user.companion,
+        streak: user.streak, highestStreak: user.highestStreak,
+        accuracy: user.accuracy, totalQuestions: user.totalQuestions,
+        achievements: user.achievements, weakSpots: user.weakSpots,
+        learningPace: user.learningPace
+      },
+      progress: {
+        totalLessons, currentLesson: (user.currentLessonIndex || 0) + 1,
+        completedLessons,
+        masteryPercentage: totalLessons > 0 ? Math.round((completedLessons / totalLessons) * 100) : 0
+      }
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Clarify ─────────────────────────────────
+app.post('/api/clarify', async (req, res) => {
+  try {
+    const { userId, situation } = req.body;
+    const question = await agentAskClarification(userId, situation);
+    res.json({ success: true, question });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Reset ───────────────────────────────────
+app.post('/api/reset-user', (req, res) => {
+  const { userId } = req.body;
+  users.delete(userId); pdfStore.delete(userId); agentMemory.delete(userId);
+  res.json({ success: true, message: 'User reset' });
+});
+
+// ── 404 ─────────────────────────────────────
+app.use((req, res) => res.status(404).json({ success: false, error: 'Not found' }));
+app.use((err, req, res, next) => res.status(500).json({ success: false, error: err.message }));
+
+// ── Start ────────────────────────────────────
+const PORT = process.env.PORT || 5000;
+app.listen(PORT, () => {
+  console.log('\n' + '🤖'.repeat(30));
+  console.log(`\n✅ AGENTIC AI LEARNING MENTOR on http://localhost:${PORT}`);
+  console.log(`🔧 Agent Tools: ${AGENT_TOOLS.length} tools registered`);
+  console.log(`🧠 Claude claude-sonnet-4-5 powering the agent loop`);
+  console.log('🤖'.repeat(30) + '\n');
+});
+
+module.exports = app;
